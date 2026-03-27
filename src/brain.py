@@ -36,9 +36,9 @@ async def ask_brain(
         user_history = get_message_history(user_id)
         print(f"[brain] 用户 {user_id} 的历史记录条数: {len(user_history)}")
         
-        # 裁剪历史，只保留最近 10 条消息
+        # 裁剪历史，只保留最近 20 条消息
         if user_history:
-            user_history = user_history[-10:]
+            user_history = user_history[-20:]
             print(f"[brain] 裁剪后的历史记录条数: {len(user_history)}")
         
         # 🎯 第二步：将当前用户消息添加到历史

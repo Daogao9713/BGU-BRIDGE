@@ -10,7 +10,7 @@ from .utils.guard import (
     mark_group_reply, mark_user_reply
 )
 from .brain import ask_brain
-from .core.action_executor import execute_decision
+from .core.action_executor import execute_decision, action_executor
 from .core.emotion_engine import apply_emotion_event, get_emotion
 from .core.user_profiles import update_user_interaction
 from .core.event_mapper import analyze_message
@@ -317,11 +317,13 @@ async def handle_private_message(event: dict):
         
         # 执行决策
         print("[23] execute_decision前")
+        req_id = action_executor.next_req_id(user_id)
         exec_result = await execute_decision(
             decision=decision,
             user_id=user_id,
             username=username,
             group_id=None,
+            req_id=req_id,
             enable_grok_refine=REFINE_WITH_GROK,
             persona_config=PERSONA_CONFIG
         )
@@ -424,11 +426,13 @@ async def handle_group_message(event: dict):
         )
         
         # 执行决策
+        req_id = action_executor.next_req_id(user_id)
         exec_result = await execute_decision(
             decision=decision,
             user_id=user_id,
             username=username,
             group_id=group_id,
+            req_id=req_id,
             enable_grok_refine=REFINE_WITH_GROK,
             persona_config=PERSONA_CONFIG
         )

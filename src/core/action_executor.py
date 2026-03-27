@@ -1,6 +1,6 @@
 """
 动作执行器 - 执行 LLM 做出的决策
-支持明确的降级链和执行失败恢复
+严格遵循 5 条执行层硬规则，不允许自作主张补文本
 """
 import asyncio
 import os
@@ -8,8 +8,9 @@ import time
 from typing import Optional, Dict, Tuple, List
 from pathlib import Path
 from dataclasses import dataclass
+from collections import defaultdict
 from PIL import Image, ImageDraw, ImageFont
-from .decision_engine import DecisionOutput, ResponseMode
+from .decision_engine import DecisionOutput, ResponseMode, clean_roxy_text
 from ..utils.tts import synthesize_tts, is_tts_alive
 from config.config import TTS_GPU_IP
 from ..interfaces.onebot_client import (
@@ -18,10 +19,9 @@ from ..interfaces.onebot_client import (
     send_private_image, send_group_image,
     send_group_poke, send_private_poke
 )
-from ..utils.content_refiner import refine_content_with_grok
 from typing import Any, Dict, Optional
 from .user_profiles import update_user_interaction
-from .emotion_engine import apply_emotion_event  # 请根据你实际的文件名修改
+from .emotion_engine import apply_emotion_event
 
 @dataclass
 class ExecutionResult:
@@ -37,6 +37,68 @@ class ExecutionResult:
     def __post_init__(self):
         if self.fallback_chain is None:
             self.fallback_chain = []
+
+
+# =========================
+# 执行层归一化函数 - 防止补文本
+# =========================
+
+def normalize_decision_for_execution(decision: DecisionOutput) -> DecisionOutput:
+    """
+    归一化决策对象，确保执行层不会自作主张补文本
+    
+    硬规则：
+    1. mode == ignore → 绝不发任何文本
+    2. should_text == false 且 mode != voice → 绝不补文本
+    3. meme 发失败 → 只有 should_text == true 才能回退文本
+    4. delay_send 前 → 必须检查是不是最新请求
+    5. 执行层不能自己造句
+    
+    Args:
+        decision: 待归一化的 DecisionOutput
+    
+    Returns:
+        归一化后的 DecisionOutput
+    """
+    if not decision:
+        return decision
+    
+    plan = decision.response_plan or {}
+    content = decision.content or {}
+    
+    mode = plan.get("mode", "text")
+    should_text = bool(plan.get("should_text", True))
+    
+    text = clean_roxy_text(content.get("text", "") or "")
+    voice_text = clean_roxy_text(content.get("voice_text", "") or "")
+    meme_tag = content.get("meme_tag")
+    meme_text = content.get("meme_text")
+    
+    # 规则 1：ignore 绝不发文本
+    if mode == "ignore":
+        content["text"] = ""
+        content["voice_text"] = ""
+        content["meme_tag"] = None
+        content["meme_text"] = None
+        plan["should_text"] = False
+        return decision
+    
+    # 规则 2：should_text=false 时，不准补文本
+    if not should_text and mode != "voice":
+        content["text"] = ""
+        content["voice_text"] = ""
+    
+    # 规则 3：voice 模式可以只保留 voice_text
+    if mode == "voice":
+        if not voice_text and text:
+            content["voice_text"] = text
+    
+    # 规则 4：text_image 如果 should_text=false，只允许发图，不允许补字
+    if mode == "text_image" and not should_text:
+        content["text"] = ""
+        content["voice_text"] = ""
+    
+    return decision
 
 
 class MemeLibrary:
@@ -128,9 +190,19 @@ class MemeLibrary:
 
 
 class ActionExecutor:
-    """动作执行器 - 支持降级链"""
+    """动作执行器 - 严格遵循 5 条硬规则，支持用户级串行锁"""
     
-    # 执行优先级和降级链定义
+    def __init__(self):
+        """初始化执行器"""
+        self.user_locks = defaultdict(asyncio.Lock)
+        self.latest_req_id = defaultdict(int)
+    
+    def next_req_id(self, user_id: int) -> int:
+        """获取该用户的下一个请求 ID"""
+        self.latest_req_id[user_id] += 1
+        return self.latest_req_id[user_id]
+    
+    # 执行优先级和降级链定义（仅供参考，实际不再使用）
     FALLBACK_CHAINS = {
         ResponseMode.VOICE: ["voice", "text"],           # 语音失败 → 文字
         ResponseMode.TEXT: ["text"],                     # 纯文字
@@ -139,40 +211,81 @@ class ActionExecutor:
         ResponseMode.DELAY: ["delay"],
     }
     
-    @staticmethod
     async def execute_decision(
+        self,
         decision: DecisionOutput,
         user_id: int,
         username: str,
         group_id: Optional[int] = None,
+        req_id: Optional[int] = None,
         enable_grok_refine: bool = False,
         persona_config: Optional[Dict[str, Any]] = None
     ) -> ExecutionResult:
         """
-        执行 LLM 的决策，支持新的字段分流 + 可选的 Grok 润色
+        执行 LLM 的决策，严格遵循 5 条执行层硬规则
+        
+        硬规则：
+        1. mode == ignore → 绝不发任何文本
+        2. should_text == false 且 mode != voice → 绝不补文本
+        3. meme 发失败 → 只有 should_text == true 才能回退文本
+        4. delay_send 发出前 → 必须检查是不是最新请求
+        5. 执行层不能自己造句（不补充 "……" / "收到" / "嗯"）
         
         Args:
             decision: DecisionOutput 对象
             user_id: 用户ID
             username: 用户名
             group_id: 群ID（如果是群聊）
-            enable_grok_refine: 是否启用 Grok 润色
+            req_id: 请求ID，用于防止旧请求延迟到达
+            enable_grok_refine: 是否启用 Grok 润色（已弃用，保留向后兼容）
             persona_config: 人物档案配置
         
         Returns:
-            ExecutionResult 包含执行结果和降级信息
+            ExecutionResult 包含执行结果
+        """
+        print(f"[executor] enter user_id={user_id}, username={username}, group_id={group_id}, req_id={req_id}")
+        
+        # 用户级串行化执行（防止同一用户并发冲突）
+        async with self.user_locks[user_id]:
+            print(f"[executor] lock acquired user_id={user_id}, req_id={req_id}")
+            
+            # 最后一次检查：是不是最新请求
+            if req_id is not None and req_id != self.latest_req_id[user_id]:
+                print(f"[executor] 旧请求被丢弃 user_id={user_id} req_id={req_id} latest={self.latest_req_id[user_id]}")
+                return ExecutionResult(
+                    success=True,
+                    action_type="skip",
+                    message="旧请求已被丢弃"
+                )
+            
+            return await self._execute_decision_sync(
+                decision, user_id, username, group_id, req_id
+            )
+    
+    async def _execute_decision_sync(
+        self,
+        decision: DecisionOutput,
+        user_id: int,
+        username: str,
+        group_id: Optional[int] = None,
+        req_id: Optional[int] = None
+    ) -> ExecutionResult:
+        """
+        同步执行决策的逻辑（由 execute_decision 在用户锁内调用）
         """
         start_time = time.time()
-        result = None
         
         try:
-            # 更新用户交互统计
+            # 第一步：归一化决策（防止补文本）
+            decision = normalize_decision_for_execution(decision)
+            
+            # 第二步：更新用户交互统计
             update_user_interaction(user_id, username)
             
-            # 应用情绪更新
+            # 第三步：应用情绪更新
             emotion_update = decision.emotion_update
             if emotion_update:
-                emotion_dict = emotion_update.to_dict() if hasattr(emotion_update, 'to_dict') else emotion_update
+                emotion_dict = emotion_update if isinstance(emotion_update, dict) else emotion_update.to_dict() if hasattr(emotion_update, 'to_dict') else {}
                 apply_emotion_event(
                     "user_interaction",
                     emotion_dict,
@@ -180,105 +293,110 @@ class ActionExecutor:
                     group_id=group_id
                 )
             
-            # 可选：用 Grok 润色文案（方案 B）
-            decision_content = decision.content
-            if enable_grok_refine and decision_content:
-                print(f"[Grok 润色] 开始润色文案")
-                decision_content = await refine_content_with_grok(
-                    decision_content,
-                    decision.response_plan,
-                    persona_config
-                )
-                print(f"[Grok 润色] 完成 → {decision_content}")
+            # 第四步：读取决策参数
+            plan = decision.response_plan or {}
+            content = decision.content or {}
             
-            # ==================== 读取新字段，分流处理 ====================
-            response_plan = decision.response_plan or {}
-            content = decision_content or {}
+            mode = plan.get("mode", "text")
+            action = plan.get("action", "none")
+            should_text = bool(plan.get("should_text", True))
+            delay_ms = int(plan.get("delay_ms", 0) or 0)
             
-            action = response_plan.get("action")  # "send", "delay_send", "poke", "meme"
-            reaction_mode = response_plan.get("reaction_mode")  # "voice", "text", etc
-            delay_ms = response_plan.get("delay_ms", 0)
-            should_text = response_plan.get("should_text", True)
-            
+            text = content.get("text", "") or ""
+            voice_text = content.get("voice_text", "") or ""
             meme_tag = content.get("meme_tag")
             meme_text = content.get("meme_text")
-            text = content.get("text") or ""
-            voice_text = content.get("voice_text") or text
             
-            # 处理延迟
-            if action == "delay_send" and delay_ms > 0:
-                print(f"[延迟] 等待 {delay_ms}ms")
-                await asyncio.sleep(delay_ms / 1000)
+            print(f"[executor:sync] user_id={user_id}, mode={mode}, action={action}, should_text={should_text}, text={text!r}, voice_text={voice_text!r}, group_id={group_id}")
             
-            # 处理 poke 动作
-            if action == "poke":
-                result = await ActionExecutor._execute_poke(user_id, group_id)
-                if result:
-                    result.execution_time_ms = (time.time() - start_time) * 1000
-                    return result
+            # ==================== 执行矩阵：严格的规则驱动 ====================
             
-            # 处理梗图动作（可能只有梗图，没有文本）
-            if action == "meme" or reaction_mode == "text_image" or (action == "send" and meme_tag):
-                result = await ActionExecutor._execute_text_image_new(
-                    text, meme_tag, meme_text, should_text, user_id, group_id
-                )
-                if result:
-                    result.execution_time_ms = (time.time() - start_time) * 1000
-                    if result.success:
-                        return result
-            
-            # 处理语音
-            if reaction_mode == "voice":
-                if not is_tts_alive(TTS_GPU_IP, 8000):
-                    print("[探针] TTS 终端未开启，自动降级为 text 模式")
-                else:
-                    result = await ActionExecutor._execute_voice(
-                        decision, user_id, group_id
-                    )
-                    if result:
-                        result.execution_time_ms = (time.time() - start_time) * 1000
-                        if result.success:
-                            return result
-            
-            # 降级到纯文本
-            if text:
-                result = await ActionExecutor._execute_text(
-                    decision, user_id, group_id
-                )
-                if result:
-                    result.execution_time_ms = (time.time() - start_time) * 1000
-                    if result.success:
-                        return result
-            
-            # 处理 ignore/delay
-            if action == "ignore":
-                result = ExecutionResult(
+            # 规则 1：ignore 模式 → 直接跳过，不发任何东西
+            if mode == "ignore":
+                print(f"[executor:sync] 规则 1 触发：ignore 模式，完全忽略")
+                return ExecutionResult(
                     success=True,
                     action_type="ignore",
                     message="决策：忽略"
                 )
-                result.execution_time_ms = (time.time() - start_time) * 1000
-                return result
             
-            if action == "delay":
-                result = ExecutionResult(
-                    success=True,
-                    action_type="delay",
-                    message="决策：延迟回复"
+            # 规则 2：delay 模式 → 延迟后重新检查再执行
+            if mode == "delay" or action == "delay_send":
+                print(f"[executor:sync] 规则 2 触发：delay 模式，转交延迟处理")
+                return await self._execute_delay(
+                    user_id, group_id, decision, delay_ms, req_id
                 )
-                result.execution_time_ms = (time.time() - start_time) * 1000
-                return result
             
-            # 默认失败
+            # 规则 3：voice 模式 → 只发语音，不补文本
+            if mode == "voice":
+                print(f"[executor:sync] 规则 3 触发：voice 模式")
+                if not voice_text:
+                    print(f"[executor:sync] voice_text 为空，返回失败")
+                    return ExecutionResult(
+                        success=False,
+                        action_type="skip",
+                        message="empty_voice_text"
+                    )
+                return await self._execute_voice(user_id, group_id, voice_text)
+            
+            # 规则 4：text_image 模式 → 图文分支，失败时只有 should_text==true 才降级
+            if mode == "text_image" or action == "meme":
+                print(f"[executor:sync] 规则 4 触发：text_image 模式")
+                meme_ok = False
+                if meme_tag:
+                    meme_ok = await self._execute_meme(
+                        user_id, group_id, meme_tag, meme_text,
+                        text if should_text and text else None
+                    )
+                
+                if meme_ok:
+                    return ExecutionResult(
+                        success=True,
+                        action_type="text_image"
+                    )
+                
+                # 梗图没发出去，检查是否需要回退到文本
+                if should_text and text:
+                    print(f"[executor:sync] 梗图失败，降级到文本 should_text={should_text}")
+                    return await self._execute_text(user_id, group_id, text)
+                
+                # 既没梗图也不发文本
+                print(f"[executor:sync] 梗图不存在且 should_text=false，放弃发送")
+                return ExecutionResult(
+                    success=False,
+                    action_type="skip",
+                    message="meme不存在且should_text==false"
+                )
+            
+            # 规则 5：普通文本模式 → 只有 should_text==true 才发
+            if mode == "text":
+                print(f"[executor:sync] 规则 5 触发：text 模式")
+                if not should_text:
+                    print(f"[executor:sync] should_text=false，放弃发送")
+                    return ExecutionResult(
+                        success=True,
+                        action_type="skip",
+                        message="should_text==false"
+                    )
+                if not text:
+                    print(f"[executor:sync] 文本为空，返回失败")
+                    return ExecutionResult(
+                        success=False,
+                        action_type="skip",
+                        message="empty_text"
+                    )
+                return await self._execute_text(user_id, group_id, text)
+            
+            # 如果没有匹配任何规则
+            print(f"[executor:sync] 未知mode: {mode}")
             return ExecutionResult(
                 success=False,
                 action_type="error",
-                error="没有可用的执行方式",
-                execution_time_ms=(time.time() - start_time) * 1000
+                message=f"未知的mode: {mode}"
             )
         
         except Exception as e:
-            print(f"[错误] 执行决策异常: {e}")
+            print(f"[executor:sync] 异常: {e}")
             return ExecutionResult(
                 success=False,
                 action_type="error",
@@ -286,310 +404,265 @@ class ActionExecutor:
                 execution_time_ms=(time.time() - start_time) * 1000
             )
     
-    @staticmethod
-    async def _execute_voice(
-        decision: DecisionOutput,
+    async def _execute_delay(
+        self,
         user_id: int,
-        group_id: Optional[int] = None
+        group_id: Optional[int],
+        decision: DecisionOutput,
+        delay_ms: int,
+        req_id: Optional[int]
     ) -> ExecutionResult:
-        """执行语音模式（优先级最高）"""
+        """处理延迟执行（释放锁后再睡眠，避免阻塞其他请求）"""
         try:
-            content = decision.content or {}
-            voice_text = content.get("voice_text") or content.get("text")
+            delay_ms = max(0, min(delay_ms or 0, 10000))  # 限制最长延迟 10 秒
             
-            if not voice_text:
+            # 记录延迟请求标识
+            print(f"[executor:delay] user_id={user_id}, req_id={req_id}, delay_ms={delay_ms}")
+            
+            # 延迟后检查是否已经过期（在锁外检查，避免阻塞）
+            if req_id is not None and req_id != self.latest_req_id[user_id]:
                 return ExecutionResult(
-                    success=False,
-                    action_type="voice",
-                    error="没有语音文本"
+                    success=True,
+                    action_type="skip",
+                    message="延迟请求已过期（立即丢弃）"
                 )
             
-            # 合成语音（最可能失败的步骤）
+            # 只预留延迟，不做实际 sleep（返回给调用方处理）
+            # 这样可以立即释放锁，让后续请求能被接收
+            async def do_delayed_execution():
+                try:
+                    # 现在在后台任务中睡眠
+                    await asyncio.sleep(delay_ms / 1000)
+                    
+                    # 再次检查是否过期
+                    if req_id is not None and req_id != self.latest_req_id[user_id]:
+                        print(f"[executor:delay] 延迟请求已过期，放弃执行 user_id={user_id} req_id={req_id}")
+                        return
+                    
+                    # 变更为目标 mode（防止无限递归 delay）
+                    target_mode = decision.response_plan.get("mode", "text")
+                    if target_mode == "delay":
+                        decision.response_plan["mode"] = "text"
+                    if decision.response_plan.get("action") == "delay_send":
+                        decision.response_plan["action"] = "none"
+                    
+                    print(f"[executor:delay] 执行延迟请求 user_id={user_id} req_id={req_id}")
+                    
+                    # 重新获取锁后执行（不能用 self.user_locks，会死锁）
+                    # 应该创建一个后台任务，由事务循环处理
+                    async with self.user_locks[user_id]:
+                        # 再次检查是否过期（获得锁后最后检查）
+                        if req_id is not None and req_id != self.latest_req_id[user_id]:
+                            print(f"[executor:delay] 在锁内检查：请求已过期，放弃 user_id={user_id} req_id={req_id}")
+                            return
+                        
+                        # 执行决策
+                        result = await self._execute_decision_sync(decision, user_id, "delayed", group_id, req_id)
+                        print(f"[executor:delay] 后台执行完成 user_id={user_id} action_type={result.action_type}")
+                
+                except Exception as e:
+                    print(f"[executor:delay] 后台执行异常: {e}")
+            
+            # 把后台任务提交给事件循环
+            asyncio.create_task(do_delayed_execution())
+            
+            # 立即返回，释放锁
+            return ExecutionResult(
+                success=True,
+                action_type="delay",
+                message=f"延迟 {delay_ms}ms 后执行（在后台任务中）"
+            )
+        
+        except Exception as e:
+            print(f"[executor:delay] 异常: {e}")
+            return ExecutionResult(
+                success=False,
+                action_type="error",
+                error=f"延迟执行异常: {e}"
+            )
+    
+    async def _execute_voice(
+        self,
+        user_id: int,
+        group_id: Optional[int],
+        voice_text: str
+    ) -> ExecutionResult:
+        """执行语音发送（带日志和超时）"""
+        try:
+            if not voice_text or not voice_text.strip():
+                print(f"[executor:voice] voice_text为空")
+                return ExecutionResult(
+                    success=False,
+                    action_type="skip",
+                    message="voice_text为空"
+                )
+            
+            print(f"[executor:voice] starting user_id={user_id}, group_id={group_id}, voice_text={voice_text!r}")
+            
+            # 检查 TTS 是否可用
+            if not is_tts_alive(TTS_GPU_IP, 8000):
+                print(f"[executor:voice] TTS离线，无法发语音")
+                return ExecutionResult(
+                    success=False,
+                    action_type="skip",
+                    message="TTS离线"
+                )
+            
+            # 合成语音（带 30 秒超时）
             try:
-                wav_path = await synthesize_tts(voice_text)
-                print(f"[语音] 合成成功: {wav_path}")
-            except Exception as e:
+                print(f"[executor:voice] 正在合成语音...")
+                wav_path = await asyncio.wait_for(
+                    synthesize_tts(voice_text),
+                    timeout=30
+                )
+                print(f"[executor:voice] 合成成功: {wav_path}")
+            except asyncio.TimeoutError:
+                print(f"[executor:voice] TTS合成超时（30秒）")
                 return ExecutionResult(
                     success=False,
-                    action_type="voice",
-                    error=f"TTS 合成失败: {e}"
+                    action_type="skip",
+                    message="TTS合成超时"
+                )
+            except Exception as e:
+                print(f"[executor:voice] TTS合成异常: {e}")
+                return ExecutionResult(
+                    success=False,
+                    action_type="skip",
+                    message=f"TTS合成失败: {e}"
                 )
             
-            # 发送语音
+            # 发送语音（带 15 秒超时）
             try:
                 if group_id:
-                    result_dict = await send_group_record(group_id, wav_path)
+                    print(f"[executor:voice] 发送到群 {group_id}")
+                    result_dict = await asyncio.wait_for(
+                        send_group_record(group_id, wav_path),
+                        timeout=15
+                    )
                 else:
-                    result_dict = await send_private_record(user_id, wav_path)
+                    print(f"[executor:voice] 发送到私聊 {user_id}")
+                    result_dict = await asyncio.wait_for(
+                        send_private_record(user_id, wav_path),
+                        timeout=15
+                    )
                 
-                if result_dict.get("status") == "ok" and result_dict.get("retcode") == 0:
-                    print(f"[语音] 发送成功")
-                    return ExecutionResult(
-                        success=True,
-                        action_type="voice",
-                        message_id=result_dict.get("data", {}).get("message_id")
-                    )
-                else:
-                    return ExecutionResult(
-                        success=False,
-                        action_type="voice",
-                        error=f"OneBot 返回错误: {result_dict}"
-                    )
-            
-            except Exception as e:
+                print(f"[executor:voice] OneBot返回 result={result_dict}")
+            except asyncio.TimeoutError:
+                print(f"[executor:voice] 发送超时（15秒） group_id={group_id} user_id={user_id}")
                 return ExecutionResult(
                     success=False,
+                    action_type="error",
+                    error="语音发送超时（15s）"
+                )
+            
+            if result_dict.get("status") == "ok" and result_dict.get("retcode") == 0:
+                print(f"[executor:voice] 发送成功")
+                return ExecutionResult(
+                    success=True,
                     action_type="voice",
-                    error=f"发送语音异常: {e}"
+                    message_id=result_dict.get("data", {}).get("message_id")
+                )
+            else:
+                print(f"[executor:voice] OneBot返回错误 status={result_dict.get('status')} retcode={result_dict.get('retcode')}")
+                return ExecutionResult(
+                    success=False,
+                    action_type="error",
+                    error=f"OneBot错误: {result_dict}"
                 )
         
         except Exception as e:
+            print(f"[executor:voice] 异常: {e}")
             return ExecutionResult(
                 success=False,
-                action_type="voice",
-                error=f"未知错误: {e}"
+                action_type="error",
+                error=f"语音异常: {e}"
             )
     
-    @staticmethod
     async def _execute_text(
-        decision: DecisionOutput,
+        self,
         user_id: int,
-        group_id: Optional[int] = None
+        group_id: Optional[int],
+        text: str
     ) -> ExecutionResult:
-        """执行文本模式（最稳定的模式）"""
+        """执行文本发送（带日志和超时）"""
         try:
-            text = (decision.content or {}).get("text")
+            text = clean_roxy_text(text) or ""
+            
+            print(f"[executor:text] starting user_id={user_id}, group_id={group_id}, text={text!r}")
             
             if not text:
+                print(f"[executor:text] 文本为空，返回失败")
                 return ExecutionResult(
                     success=False,
-                    action_type="text",
-                    error="没有文本内容"
+                    action_type="skip",
+                    message="文本为空"
                 )
             
-            if group_id:
-                result_dict = await send_group_text(group_id, text)
-            else:
-                result_dict = await send_private_text(user_id, text)
+            # 发送文本（带 15 秒超时）
+            try:
+                if group_id:
+                    result_dict = await asyncio.wait_for(
+                        send_group_text(group_id, text),
+                        timeout=15
+                    )
+                else:
+                    result_dict = await asyncio.wait_for(
+                        send_private_text(user_id, text),
+                        timeout=15
+                    )
+                
+                print(f"[executor:text] OneBot返回 result={result_dict}")
+            except asyncio.TimeoutError:
+                print(f"[executor:text] OneBot超时（15秒） group_id={group_id} user_id={user_id}")
+                return ExecutionResult(
+                    success=False,
+                    action_type="error",
+                    error="文本发送超时（15s）"
+                )
             
             if result_dict.get("status") == "ok" and result_dict.get("retcode") == 0:
-                print(f"[文本] 发送成功")
+                print(f"[executor:text] 发送成功")
                 return ExecutionResult(
                     success=True,
                     action_type="text",
                     message_id=result_dict.get("data", {}).get("message_id")
                 )
             else:
+                print(f"[executor:text] OneBot返回错误 status={result_dict.get('status')} retcode={result_dict.get('retcode')}")
                 return ExecutionResult(
                     success=False,
-                    action_type="text",
+                    action_type="error",
                     error=f"发送失败: {result_dict}"
                 )
         
         except Exception as e:
+            print(f"[executor:text] 异常: {e}")
             return ExecutionResult(
                 success=False,
-                action_type="text",
-                error=f"发送文本异常: {e}"
+                action_type="error",
+                error=f"文本异常: {e}"
             )
     
-    @staticmethod
-    async def _execute_text_image(
-        decision: DecisionOutput,
+    async def _execute_meme(
+        self,
         user_id: int,
-        group_id: Optional[int] = None
-    ) -> ExecutionResult:
-        """执行文本+梗图模式（复杂，易失败，故排在较后）"""
-        try:
-            content = decision.content or {}
-            text = content.get("text")
-            meme_tag = content.get("meme_tag")
-            meme_text = content.get("meme_text")
-            
-            if not text:
-                return ExecutionResult(
-                    success=False,
-                    action_type="text_image",
-                    error="没有文本内容"
-                )
-            
-            # 获取梗图路径
-            meme_path = None
-            try:
-                meme_path = MemeLibrary.get_meme_path(meme_tag)
-            except Exception as e:
-                print(f"[梗图] 获取梗图失败: {e}")
-            
-            # 如果没有梗图，只发文本
-            if not meme_path:
-                print(f"[梗图] 梗图不存在，降级为纯文本")
-                return ExecutionResult(
-                    success=False,
-                    action_type="text_image",
-                    error="梗图不存在"
-                )
-            
-            # 如果有梗图文字，则生成动态梗图
-            if meme_text:
-                try:
-                    output_path = f"./cache/dynamic_memes/{user_id}_{int(time.time())}.jpg"
-                    if MemeLibrary.create_dynamic_meme(meme_path, meme_text, output_path):
-                        meme_path = output_path
-                        print(f"[梗图] 动态梗图生成成功")
-                    else:
-                        print(f"[梗图] 动态梗图生成失败，使用原图")
-                except Exception as e:
-                    print(f"[梗图] 动态梗图生成异常: {e}")
-            
-            # 发送文本 + 梗图
-            try:
-                if group_id:
-                    # 先发文本
-                    result_text = await send_group_text(group_id, text)
-                    
-                    # 再发梗图
-                    if meme_path and os.path.exists(meme_path):
-                        result_image = await send_group_image(group_id, meme_path)
-                        text_ok = result_text.get("status") == "ok" and result_text.get("retcode") == 0
-                        image_ok = result_image.get("status") == "ok" and result_image.get("retcode") == 0
-                    else:
-                        text_ok = result_text.get("status") == "ok" and result_text.get("retcode") == 0
-                        image_ok = False
-                else:
-                    # 先发文本
-                    result_text = await send_private_text(user_id, text)
-                    
-                    # 再发梗图
-                    if meme_path and os.path.exists(meme_path):
-                        result_image = await send_private_image(user_id, meme_path)
-                        text_ok = result_text.get("status") == "ok" and result_text.get("retcode") == 0
-                        image_ok = result_image.get("status") == "ok" and result_image.get("retcode") == 0
-                    else:
-                        text_ok = result_text.get("status") == "ok" and result_text.get("retcode") == 0
-                        image_ok = False
-                
-                if text_ok:
-                    if image_ok:
-                        print(f"[文本+梗图] 发送成功")
-                        return ExecutionResult(
-                            success=True,
-                            action_type="text_image"
-                        )
-                    else:
-                        # 文本成功，梗图失败
-                        print(f"[文本+梗图] 梗图发送失败，但文本已发送")
-                        return ExecutionResult(
-                            success=True,
-                            action_type="text_image",
-                            message="文本已发送，梗图发送失败"
-                        )
-                else:
-                    return ExecutionResult(
-                        success=False,
-                        action_type="text_image",
-                        error="文本发送失败"
-                    )
-            
-            except Exception as e:
-                print(f"[梗图] 发送异常: {e}")
-                return ExecutionResult(
-                    success=False,
-                    action_type="text_image",
-                    error=f"发送异常: {e}"
-                )
-        
-        except Exception as e:
-            return ExecutionResult(
-                success=False,
-                action_type="text_image",
-                error=f"未知错误: {e}"
-            )
-    
-    @staticmethod
-    async def _execute_poke(
-        user_id: int,
-        group_id: Optional[int] = None
-    ) -> ExecutionResult:
-        """执行戳一戳动作"""
-        try:
-            if group_id:
-                result_dict = await send_group_poke(group_id, user_id)
-            else:
-                result_dict = await send_private_poke(user_id)
-            
-            if result_dict.get("status") == "ok" and result_dict.get("retcode") == 0:
-                print(f"[戳一戳] 发送成功")
-                return ExecutionResult(
-                    success=True,
-                    action_type="poke"
-                )
-            else:
-                return ExecutionResult(
-                    success=False,
-                    action_type="poke",
-                    error=f"戳一戳失败: {result_dict}"
-                )
-        
-        except Exception as e:
-            return ExecutionResult(
-                success=False,
-                action_type="poke",
-                error=f"戳一戳异常: {e}"
-            )
-    
-    @staticmethod
-    async def _execute_text_image_new(
-        text: str,
-        meme_tag: Optional[str],
+        group_id: Optional[int],
+        meme_tag: str,
         meme_text: Optional[str],
-        should_text: bool,
-        user_id: int,
-        group_id: Optional[int] = None
-    ) -> ExecutionResult:
+        accompanying_text: Optional[str] = None
+    ) -> bool:
         """
-        执行新的文本+梗图模式 - 支持 should_text 字段
+        执行梗图发送
         
-        Args:
-            text: 主文本
-            meme_tag: 梗图标签
-            meme_text: 梗图上的文字
-            should_text: 是否应该发文本
-            user_id: 用户ID
-            group_id: 群ID（如果是群聊）
-        
-        Returns:
-            ExecutionResult
+        返回 True 表示梗图本身发送成功
+        返回 False 表示梗图发送失败（调用方需要决定是否降级到文本）
         """
         try:
             # 获取梗图路径
-            meme_path = None
-            if meme_tag:
-                try:
-                    meme_path = MemeLibrary.get_meme_path(meme_tag)
-                except Exception as e:
-                    print(f"[梗图] 获取梗图失败: {e}")
-            
-            # 如果没有梗图，只发文本（如果 should_text）
+            meme_path = MemeLibrary.get_meme_path(meme_tag)
             if not meme_path:
-                print(f"[梗图] 梗图不存在 ({meme_tag})")
-                if should_text and text:
-                    if group_id:
-                        result_dict = await send_group_text(group_id, text)
-                    else:
-                        result_dict = await send_private_text(user_id, text)
-                    
-                    if result_dict.get("status") == "ok" and result_dict.get("retcode") == 0:
-                        return ExecutionResult(
-                            success=True,
-                            action_type="text_image",
-                            message="仅发送文本"
-                        )
-                
-                return ExecutionResult(
-                    success=False,
-                    action_type="text_image",
-                    error="梗图不存在，文本为空或不发送"
-                )
+                print(f"[梗图] 梗图不存在: {meme_tag}")
+                return False
             
             # 如果有梗图文字，则生成动态梗图
             if meme_text:
@@ -601,72 +674,33 @@ class ActionExecutor:
                     else:
                         print(f"[梗图] 动态梗图生成失败，使用原图")
                 except Exception as e:
-                    print(f"[梗图] 动态梗图生成异常: {e}")
+                    print(f"[梗图] 动态生成异常: {e}")
             
-            # 发送文本 + 梗图
-            try:
+            # 发送梗图（可能带文字）
+            if accompanying_text:
                 if group_id:
-                    # 先发文本（如果 should_text）
-                    text_ok = True
-                    if should_text and text:
-                        result_text = await send_group_text(group_id, text)
-                        text_ok = result_text.get("status") == "ok" and result_text.get("retcode") == 0
-                    
-                    # 再发梗图
-                    if meme_path and os.path.exists(meme_path):
-                        result_image = await send_group_image(group_id, meme_path)
-                        image_ok = result_image.get("status") == "ok" and result_image.get("retcode") == 0
-                    else:
-                        image_ok = False
+                    await send_group_text(group_id, accompanying_text)
                 else:
-                    # 先发文本（如果 should_text）
-                    text_ok = True
-                    if should_text and text:
-                        result_text = await send_private_text(user_id, text)
-                        text_ok = result_text.get("status") == "ok" and result_text.get("retcode") == 0
-                    
-                    # 再发梗图
-                    if meme_path and os.path.exists(meme_path):
-                        result_image = await send_private_image(user_id, meme_path)
-                        image_ok = result_image.get("status") == "ok" and result_image.get("retcode") == 0
-                    else:
-                        image_ok = False
-                
-                if image_ok:
-                    print(f"[文本+梗图] 发送成功")
-                    return ExecutionResult(
-                        success=True,
-                        action_type="text_image"
-                    )
-                elif text_ok:
-                    # 梗图失败但文本成功
-                    print(f"[文本+梗图] 梗图发送失败，但文本已发送")
-                    return ExecutionResult(
-                        success=True,
-                        action_type="text_image",
-                        message="文本已发送，梗图发送失败"
-                    )
-                else:
-                    return ExecutionResult(
-                        success=False,
-                        action_type="text_image",
-                        error="文本和梗图都未成功发送"
-                    )
+                    await send_private_text(user_id, accompanying_text)
             
-            except Exception as e:
-                print(f"[梗图] 发送异常: {e}")
-                return ExecutionResult(
-                    success=False,
-                    action_type="text_image",
-                    error=f"发送异常: {e}"
-                )
+            # 发送梗图
+            if meme_path and os.path.exists(meme_path):
+                if group_id:
+                    result_dict = await send_group_image(group_id, meme_path)
+                else:
+                    result_dict = await send_private_image(user_id, meme_path)
+                
+                if result_dict.get("status") == "ok" and result_dict.get("retcode") == 0:
+                    print(f"[梗图] 发送成功")
+                    return True
+            
+            return False
         
         except Exception as e:
-            return ExecutionResult(
-                success=False,
-                action_type="text_image",
-                error=f"未知错误: {e}"
-            )
+            print(f"[梗图] 异常: {e}")
+            return False
+    
+
 
 
 # ==================== 梗图映射表 ====================
@@ -721,15 +755,31 @@ async def execute_decision(
     user_id: int,
     username: str,
     group_id: Optional[int] = None,
+    req_id: Optional[int] = None,
     enable_grok_refine: bool = False,
     persona_config: Optional[Dict[str, Any]] = None
 ) -> ExecutionResult:
-    """执行决策 - 返回 ExecutionResult 包含详细的执行信息，支持 Grok 润色"""
+    """
+    执行决策的全局便利函数 - 返回 ExecutionResult 包含详细的执行信息
+    
+    Args:
+        decision: DecisionOutput 对象
+        user_id: 用户ID
+        username: 用户名
+        group_id: 群ID（如果是群聊）
+        req_id: 请求ID，用于防止旧请求延迟到达
+        enable_grok_refine: 是否启用 Grok 润色（已弃用）
+        persona_config: 人物档案配置
+    
+    Returns:
+        ExecutionResult 包含执行结果
+    """
     return await action_executor.execute_decision(
         decision, 
         user_id, 
         username, 
         group_id,
+        req_id,
         enable_grok_refine,
         persona_config
     )
