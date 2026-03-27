@@ -4,9 +4,9 @@ Brain - Roxy v2 决策层
 包含滑动记忆窗口支持
 """
 from typing import Optional, Dict
-from decision_engine import make_decision, DecisionOutput
-from config import PERSONA_CONFIG
-from user_profiles import get_message_history, add_message_to_history
+from .core.decision_engine import make_decision, DecisionOutput
+from config.config import PERSONA_CONFIG
+from .core.user_profiles import get_message_history, add_message_to_history
 
 
 async def ask_brain(
@@ -35,6 +35,11 @@ async def ask_brain(
         # 🎯 第一步：获取用户的对话历史（滑动窗口）
         user_history = get_message_history(user_id)
         print(f"[brain] 用户 {user_id} 的历史记录条数: {len(user_history)}")
+        
+        # 裁剪历史，只保留最近 10 条消息
+        if user_history:
+            user_history = user_history[-10:]
+            print(f"[brain] 裁剪后的历史记录条数: {len(user_history)}")
         
         # 🎯 第二步：将当前用户消息添加到历史
         add_message_to_history(user_id, "user", user_text)

@@ -173,7 +173,7 @@ class UserProfileManager:
         })
         
         # 滑动窗口：只保留最近的 8 条对话（4个回合），防止 Token 爆炸
-        max_history = 8
+        max_history = 30  # 你可以根据实际情况调整这个值
         if len(profile.history) > max_history:
             profile.history = profile.history[-max_history:]
             print(f"[历史] 用户 {user_id} 的对话历史超限，仅保留最近 {max_history} 条")

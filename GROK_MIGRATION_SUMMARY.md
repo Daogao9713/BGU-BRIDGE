@@ -17,7 +17,7 @@
 # Grok (xAI) 配置 - 主服务
 GROK_API_KEY = (os.getenv("GROK_API_KEY", "") or "").strip()
 GROK_BASE_URL = (os.getenv("GROK_BASE_URL", "https://api.x.ai/v1") or "").strip()
-MODEL_NAME = (os.getenv("MODEL_NAME", "grok-3-mini") or "").strip()
+MODEL_NAME = (os.getenv("MODEL_NAME", "grok-4-fast-non-reasoning") or "").strip()
 ```
 
 **说明**：
@@ -97,7 +97,7 @@ def add_message_to_history(self, user_id: int, role: str, content: str) -> None:
     profile.history.append({"role": role, "content": content})
     
     # 滑动窗口：只保留最近的 8 条对话（4个回合）
-    max_history = 8
+    max_history = 30
     if len(profile.history) > max_history:
         profile.history = profile.history[-max_history:]
     
@@ -189,7 +189,7 @@ ask_brain() - 大脑控制层
 # Grok (xAI) - 必需
 GROK_API_KEY="xai-..."
 GROK_BASE_URL="https://api.x.ai/v1"
-MODEL_NAME="grok-3-mini"  # 或 grok-2-latest
+MODEL_NAME="grok-4-fast-non-reasoning"  # 或 grok-2-latest
 
 # OpenAI - 可选（备用）
 OPENAI_API_KEY="sk-..."

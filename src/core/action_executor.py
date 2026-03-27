@@ -9,16 +9,19 @@ from typing import Optional, Dict, Tuple, List
 from pathlib import Path
 from dataclasses import dataclass
 from PIL import Image, ImageDraw, ImageFont
-from decision_engine import DecisionOutput, ResponseMode
-from tts import synthesize_tts
-from onebot_client import (
+from .decision_engine import DecisionOutput, ResponseMode
+from ..utils.tts import synthesize_tts, is_tts_alive
+from config.config import TTS_GPU_IP
+from ..interfaces.onebot_client import (
     send_private_text, send_group_text,
     send_private_record, send_group_record,
-    send_private_image, send_group_image
+    send_private_image, send_group_image,
+    send_group_poke, send_private_poke
 )
-from emotion_engine import apply_emotion_event
-from user_profiles import update_user_interaction
-
+from ..utils.content_refiner import refine_content_with_grok
+from typing import Any, Dict, Optional
+from .user_profiles import update_user_interaction
+from .emotion_engine import apply_emotion_event  # 请根据你实际的文件名修改
 
 @dataclass
 class ExecutionResult:
@@ -141,16 +144,20 @@ class ActionExecutor:
         decision: DecisionOutput,
         user_id: int,
         username: str,
-        group_id: Optional[int] = None
+        group_id: Optional[int] = None,
+        enable_grok_refine: bool = False,
+        persona_config: Optional[Dict[str, Any]] = None
     ) -> ExecutionResult:
         """
-        执行 LLM 的决策，带降级链支持
+        执行 LLM 的决策，支持新的字段分流 + 可选的 Grok 润色
         
         Args:
             decision: DecisionOutput 对象
             user_id: 用户ID
             username: 用户名
             group_id: 群ID（如果是群聊）
+            enable_grok_refine: 是否启用 Grok 润色
+            persona_config: 人物档案配置
         
         Returns:
             ExecutionResult 包含执行结果和降级信息
@@ -173,65 +180,102 @@ class ActionExecutor:
                     group_id=group_id
                 )
             
-            # 根据响应模式执行，使用降级链
-            mode_str = decision.response_plan.get("mode", "text")
-            try:
-                mode = ResponseMode(mode_str)
-            except (ValueError, KeyError):
-                mode = ResponseMode.TEXT
-            fallback_chain = ActionExecutor.FALLBACK_CHAINS.get(mode, ["text"])
+            # 可选：用 Grok 润色文案（方案 B）
+            decision_content = decision.content
+            if enable_grok_refine and decision_content:
+                print(f"[Grok 润色] 开始润色文案")
+                decision_content = await refine_content_with_grok(
+                    decision_content,
+                    decision.response_plan,
+                    persona_config
+                )
+                print(f"[Grok 润色] 完成 → {decision_content}")
             
-            # 尝试执行链中的每个动作
-            for action in fallback_chain:
-                if action == "voice":
+            # ==================== 读取新字段，分流处理 ====================
+            response_plan = decision.response_plan or {}
+            content = decision_content or {}
+            
+            action = response_plan.get("action")  # "send", "delay_send", "poke", "meme"
+            reaction_mode = response_plan.get("reaction_mode")  # "voice", "text", etc
+            delay_ms = response_plan.get("delay_ms", 0)
+            should_text = response_plan.get("should_text", True)
+            
+            meme_tag = content.get("meme_tag")
+            meme_text = content.get("meme_text")
+            text = content.get("text") or ""
+            voice_text = content.get("voice_text") or text
+            
+            # 处理延迟
+            if action == "delay_send" and delay_ms > 0:
+                print(f"[延迟] 等待 {delay_ms}ms")
+                await asyncio.sleep(delay_ms / 1000)
+            
+            # 处理 poke 动作
+            if action == "poke":
+                result = await ActionExecutor._execute_poke(user_id, group_id)
+                if result:
+                    result.execution_time_ms = (time.time() - start_time) * 1000
+                    return result
+            
+            # 处理梗图动作（可能只有梗图，没有文本）
+            if action == "meme" or reaction_mode == "text_image" or (action == "send" and meme_tag):
+                result = await ActionExecutor._execute_text_image_new(
+                    text, meme_tag, meme_text, should_text, user_id, group_id
+                )
+                if result:
+                    result.execution_time_ms = (time.time() - start_time) * 1000
+                    if result.success:
+                        return result
+            
+            # 处理语音
+            if reaction_mode == "voice":
+                if not is_tts_alive(TTS_GPU_IP, 8000):
+                    print("[探针] TTS 终端未开启，自动降级为 text 模式")
+                else:
                     result = await ActionExecutor._execute_voice(
                         decision, user_id, group_id
                     )
-                elif action == "text":
-                    result = await ActionExecutor._execute_text(
-                        decision, user_id, group_id
-                    )
-                elif action == "text_image":
-                    result = await ActionExecutor._execute_text_image(
-                        decision, user_id, group_id
-                    )
-                elif action == "ignore":
-                    result = ExecutionResult(
-                        success=True,
-                        action_type="ignore",
-                        message="决策：忽略"
-                    )
-                elif action == "delay":
-                    result = ExecutionResult(
-                        success=True,
-                        action_type="delay",
-                        message="决策：延迟回复"
-                    )
-                
+                    if result:
+                        result.execution_time_ms = (time.time() - start_time) * 1000
+                        if result.success:
+                            return result
+            
+            # 降级到纯文本
+            if text:
+                result = await ActionExecutor._execute_text(
+                    decision, user_id, group_id
+                )
                 if result:
                     result.execution_time_ms = (time.time() - start_time) * 1000
-                    
-                    # 如果成功，返回
                     if result.success:
                         return result
-                    
-                    # 如果失败，记录到降级链并继续尝试下一个
-                    if result.fallback_chain is None:
-                        result.fallback_chain = []
-                    result.fallback_chain.append(action)
-                    
-                    print(f"[降级] {action} 失败: {result.error}")
-                    continue
             
-            # 所有降级都失败了
-            if result:
-                return result
-            else:
-                return ExecutionResult(
-                    success=False,
-                    action_type="none",
-                    error="没有可用的执行方式"
+            # 处理 ignore/delay
+            if action == "ignore":
+                result = ExecutionResult(
+                    success=True,
+                    action_type="ignore",
+                    message="决策：忽略"
                 )
+                result.execution_time_ms = (time.time() - start_time) * 1000
+                return result
+            
+            if action == "delay":
+                result = ExecutionResult(
+                    success=True,
+                    action_type="delay",
+                    message="决策：延迟回复"
+                )
+                result.execution_time_ms = (time.time() - start_time) * 1000
+                return result
+            
+            # 默认失败
+            return ExecutionResult(
+                success=False,
+                action_type="error",
+                error="没有可用的执行方式",
+                execution_time_ms=(time.time() - start_time) * 1000
+            )
         
         except Exception as e:
             print(f"[错误] 执行决策异常: {e}")
@@ -460,6 +504,211 @@ class ActionExecutor:
                 action_type="text_image",
                 error=f"未知错误: {e}"
             )
+    
+    @staticmethod
+    async def _execute_poke(
+        user_id: int,
+        group_id: Optional[int] = None
+    ) -> ExecutionResult:
+        """执行戳一戳动作"""
+        try:
+            if group_id:
+                result_dict = await send_group_poke(group_id, user_id)
+            else:
+                result_dict = await send_private_poke(user_id)
+            
+            if result_dict.get("status") == "ok" and result_dict.get("retcode") == 0:
+                print(f"[戳一戳] 发送成功")
+                return ExecutionResult(
+                    success=True,
+                    action_type="poke"
+                )
+            else:
+                return ExecutionResult(
+                    success=False,
+                    action_type="poke",
+                    error=f"戳一戳失败: {result_dict}"
+                )
+        
+        except Exception as e:
+            return ExecutionResult(
+                success=False,
+                action_type="poke",
+                error=f"戳一戳异常: {e}"
+            )
+    
+    @staticmethod
+    async def _execute_text_image_new(
+        text: str,
+        meme_tag: Optional[str],
+        meme_text: Optional[str],
+        should_text: bool,
+        user_id: int,
+        group_id: Optional[int] = None
+    ) -> ExecutionResult:
+        """
+        执行新的文本+梗图模式 - 支持 should_text 字段
+        
+        Args:
+            text: 主文本
+            meme_tag: 梗图标签
+            meme_text: 梗图上的文字
+            should_text: 是否应该发文本
+            user_id: 用户ID
+            group_id: 群ID（如果是群聊）
+        
+        Returns:
+            ExecutionResult
+        """
+        try:
+            # 获取梗图路径
+            meme_path = None
+            if meme_tag:
+                try:
+                    meme_path = MemeLibrary.get_meme_path(meme_tag)
+                except Exception as e:
+                    print(f"[梗图] 获取梗图失败: {e}")
+            
+            # 如果没有梗图，只发文本（如果 should_text）
+            if not meme_path:
+                print(f"[梗图] 梗图不存在 ({meme_tag})")
+                if should_text and text:
+                    if group_id:
+                        result_dict = await send_group_text(group_id, text)
+                    else:
+                        result_dict = await send_private_text(user_id, text)
+                    
+                    if result_dict.get("status") == "ok" and result_dict.get("retcode") == 0:
+                        return ExecutionResult(
+                            success=True,
+                            action_type="text_image",
+                            message="仅发送文本"
+                        )
+                
+                return ExecutionResult(
+                    success=False,
+                    action_type="text_image",
+                    error="梗图不存在，文本为空或不发送"
+                )
+            
+            # 如果有梗图文字，则生成动态梗图
+            if meme_text:
+                try:
+                    output_path = f"./cache/dynamic_memes/{user_id}_{int(time.time())}.jpg"
+                    if MemeLibrary.create_dynamic_meme(meme_path, meme_text, output_path):
+                        meme_path = output_path
+                        print(f"[梗图] 动态梗图生成成功")
+                    else:
+                        print(f"[梗图] 动态梗图生成失败，使用原图")
+                except Exception as e:
+                    print(f"[梗图] 动态梗图生成异常: {e}")
+            
+            # 发送文本 + 梗图
+            try:
+                if group_id:
+                    # 先发文本（如果 should_text）
+                    text_ok = True
+                    if should_text and text:
+                        result_text = await send_group_text(group_id, text)
+                        text_ok = result_text.get("status") == "ok" and result_text.get("retcode") == 0
+                    
+                    # 再发梗图
+                    if meme_path and os.path.exists(meme_path):
+                        result_image = await send_group_image(group_id, meme_path)
+                        image_ok = result_image.get("status") == "ok" and result_image.get("retcode") == 0
+                    else:
+                        image_ok = False
+                else:
+                    # 先发文本（如果 should_text）
+                    text_ok = True
+                    if should_text and text:
+                        result_text = await send_private_text(user_id, text)
+                        text_ok = result_text.get("status") == "ok" and result_text.get("retcode") == 0
+                    
+                    # 再发梗图
+                    if meme_path and os.path.exists(meme_path):
+                        result_image = await send_private_image(user_id, meme_path)
+                        image_ok = result_image.get("status") == "ok" and result_image.get("retcode") == 0
+                    else:
+                        image_ok = False
+                
+                if image_ok:
+                    print(f"[文本+梗图] 发送成功")
+                    return ExecutionResult(
+                        success=True,
+                        action_type="text_image"
+                    )
+                elif text_ok:
+                    # 梗图失败但文本成功
+                    print(f"[文本+梗图] 梗图发送失败，但文本已发送")
+                    return ExecutionResult(
+                        success=True,
+                        action_type="text_image",
+                        message="文本已发送，梗图发送失败"
+                    )
+                else:
+                    return ExecutionResult(
+                        success=False,
+                        action_type="text_image",
+                        error="文本和梗图都未成功发送"
+                    )
+            
+            except Exception as e:
+                print(f"[梗图] 发送异常: {e}")
+                return ExecutionResult(
+                    success=False,
+                    action_type="text_image",
+                    error=f"发送异常: {e}"
+                )
+        
+        except Exception as e:
+            return ExecutionResult(
+                success=False,
+                action_type="text_image",
+                error=f"未知错误: {e}"
+            )
+
+
+# ==================== 梗图映射表 ====================
+
+MEME_MAP = {
+    "sweat": [
+        "memes/sweat_01.jpg",
+        "memes/sweat_02.jpg",
+    ],
+    "stare": [
+        "memes/stare_01.jpg",
+    ],
+    "mock": [
+        "memes/mock_01.jpg",
+        "memes/mock_02.jpg",
+    ],
+    "silent": [
+        "memes/silent_01.jpg",
+    ],
+    "disgust": [
+        "memes/disgust_01.jpg",
+    ],
+}
+
+
+import random
+
+
+def pick_meme_file(tag: str) -> Optional[str]:
+    """
+    随机选择一个梗图
+    
+    Args:
+        tag: 梗图标签
+    
+    Returns:
+        梗图路径或 None
+    """
+    files = MEME_MAP.get(tag, [])
+    if not files:
+        return None
+    return random.choice(files)
 
 
 
@@ -471,7 +720,16 @@ async def execute_decision(
     decision: DecisionOutput,
     user_id: int,
     username: str,
-    group_id: Optional[int] = None
+    group_id: Optional[int] = None,
+    enable_grok_refine: bool = False,
+    persona_config: Optional[Dict[str, Any]] = None
 ) -> ExecutionResult:
-    """执行决策 - 返回 ExecutionResult 包含详细的执行信息"""
-    return await action_executor.execute_decision(decision, user_id, username, group_id)
+    """执行决策 - 返回 ExecutionResult 包含详细的执行信息，支持 Grok 润色"""
+    return await action_executor.execute_decision(
+        decision, 
+        user_id, 
+        username, 
+        group_id,
+        enable_grok_refine,
+        persona_config
+    )

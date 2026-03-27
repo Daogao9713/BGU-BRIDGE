@@ -16,15 +16,21 @@ class EmotionState:
     fatigue: float = 15.0       # 疲惫
     pride: float = 70.0         # 傲娇 / 自尊
     stress: float = 10.0        # 群聊压力
+    last_active_time: float = field(default_factory=time.time)  # 上次活跃时间戳
     
     def clamp(self) -> None:
         """确保所有值在[0, 100]范围内"""
         for key in self.__dataclass_fields__:
+            if key == "last_active_time":  # 跳过时间戳字段
+                continue
             val = getattr(self, key)
             setattr(self, key, max(0, min(100, val)))
     
     def to_dict(self) -> Dict[str, float]:
-        return asdict(self)
+        """转为字典（排除时间戳）"""
+        d = asdict(self)
+        d.pop("last_active_time", None)  # 移除时间戳，避免序列化问题
+        return d
 
 
 @dataclass
@@ -245,16 +251,20 @@ class EmotionEngine:
                    group_id: Optional[int] = None) -> EmotionState:
         """
         获取当前情绪（综合全局 + 用户/群聊维度）
+        并根据离线时间自动衰减负面情绪
         """
         self._update_decay()
         
         # 基础是全局情绪
         emotion = EmotionState(**self._global_emotion.to_dict())
+        emotion.last_active_time = self._global_emotion.last_active_time
         
         # 叠加用户维度
         if user_id is not None and user_id in self._user_emotion_delta:
             user_delta = self._user_emotion_delta[user_id]
             for key in emotion.__dataclass_fields__:
+                if key == "last_active_time":
+                    continue
                 val = getattr(emotion, key) + getattr(user_delta, key)
                 setattr(emotion, key, val)
         
@@ -262,8 +272,29 @@ class EmotionEngine:
         if group_id is not None and group_id in self._group_emotion_delta:
             group_delta = self._group_emotion_delta[group_id]
             for key in emotion.__dataclass_fields__:
+                if key == "last_active_time":
+                    continue
                 val = getattr(emotion, key) + getattr(group_delta, key)
                 setattr(emotion, key, val)
+        
+        # ==========================================
+        # [新增] 离线自动衰减：时间是最好的解药
+        # ==========================================
+        now = time.time()
+        hours_passed = int((now - emotion.last_active_time) // 3600)
+        
+        if hours_passed >= 1:
+            # 每离线 1 小时，自动掉 20 点负面情绪
+            decay_amount = hours_passed * 20.0
+            
+            emotion.anger = max(0.0, emotion.anger - decay_amount)
+            emotion.fatigue = max(0.0, emotion.fatigue - decay_amount)
+            emotion.stress = max(0.0, emotion.stress - decay_amount)
+            
+            print(f"[情绪] 用户离线 {hours_passed} 小时，自动泄压：anger -{decay_amount}, fatigue -{decay_amount}, stress -{decay_amount}")
+        
+        # 更新活跃时间戳
+        emotion.last_active_time = now
         
         emotion.clamp()
         return emotion

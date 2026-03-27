@@ -1,5 +1,5 @@
 import httpx
-from config import NAPCAT_API, ONEBOT_TOKEN
+from config.config import NAPCAT_API, ONEBOT_TOKEN
 
 BASE_URL = NAPCAT_API.rstrip("/")
 
@@ -108,6 +108,50 @@ async def send_group_image(group_id: int, file_path: str):
                         }
                     }
                 ]
+            }
+        )
+        r.raise_for_status()
+        return r.json()
+
+async def send_group_poke(group_id: int, user_id: int):
+    """
+    发送群戳一戳
+    
+    Args:
+        group_id: 群号
+        user_id: 被戳的用户QQ号
+    
+    Returns:
+        API 响应
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            f"{BASE_URL}/group_poke",
+            headers=headers,
+            json={
+                "group_id": str(group_id),
+                "user_id": str(user_id)
+            }
+        )
+        r.raise_for_status()
+        return r.json()
+
+async def send_private_poke(user_id: int):
+    """
+    发送私聊戳一戳
+    
+    Args:
+        user_id: 被戳的用户QQ号
+    
+    Returns:
+        API 响应
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            f"{BASE_URL}/poke",
+            headers=headers,
+            json={
+                "user_id": str(user_id)
             }
         )
         r.raise_for_status()

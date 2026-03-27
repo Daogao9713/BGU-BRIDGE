@@ -1,11 +1,32 @@
 # tts.py
 import os
 import uuid
+import socket
 import httpx
-from config import TTS_BASE_URL, TTS_INFER_URL, TTS_SPEAKER
+from config.config import TTS_BASE_URL, TTS_INFER_URL, TTS_SPEAKER
 
 OUT_DIR = "./cache/wav"
 os.makedirs(OUT_DIR, exist_ok=True)
+
+
+def is_tts_alive(host: str = "127.0.0.1", port: int = 8000, timeout: float = 0.1) -> bool:
+    """
+    极速探测 TTS 终端是否在线。
+    使用 socket 连接进行最小化开销的活性检测。
+    
+    Args:
+        host: TTS 服务器地址，默认本地
+        port: TTS 服务器端口，默认 8000
+        timeout: 连接超时时间，默认 0.1 秒
+    
+    Returns:
+        True 表示 TTS 服务在线，False 表示离线或无法连接
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return False
 
 async def synthesize_tts(text: str, character_name: str = None) -> str:
     if not text:

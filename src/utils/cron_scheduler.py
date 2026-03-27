@@ -9,7 +9,7 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import httpx
-from logger import log_app
+from .logger import log_app
 
 
 # 新闻 API 源

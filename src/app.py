@@ -1,20 +1,24 @@
 from fastapi import FastAPI, Request, BackgroundTasks
 from contextlib import asynccontextmanager
-from config import BOT_QQ, TRIGGER_PREFIX, TARGET_GROUP_ID
-from guard import (
+from config.config import (
+    BOT_QQ, TRIGGER_PREFIX, TARGET_GROUP_ID, 
+    LLM_PROVIDER, MODEL_NAME, ACTIVE_API_KEY, ACTIVE_PROVIDER_NAME,
+    REFINE_WITH_GROK, PERSONA_CONFIG
+)
+from .utils.guard import (
     group_in_cooldown, user_in_cooldown,
     mark_group_reply, mark_user_reply
 )
-from brain import ask_brain
-from action_executor import execute_decision
-from emotion_engine import apply_emotion_event, get_emotion
-from user_profiles import update_user_interaction
-from event_mapper import analyze_message
-from logger import (
+from .brain import ask_brain
+from .core.action_executor import execute_decision
+from .core.emotion_engine import apply_emotion_event, get_emotion
+from .core.user_profiles import update_user_interaction
+from .core.event_mapper import analyze_message
+from .utils.logger import (
     log_app, log_message, log_emotion_change, log_decision,
     log_action, log_event_analysis
 )
-from cron_scheduler import RoxyBiorhythm
+from .utils.cron_scheduler import RoxyBiorhythm
 
 # ============= 初始化生物钟 =============
 biorhythm = RoxyBiorhythm(target_group_id=TARGET_GROUP_ID)
@@ -44,11 +48,31 @@ def extract_text(event: dict) -> str:
 
 def is_at_me(event: dict) -> bool:
     msgs = event.get("message", [])
+    self_id = str(event.get("self_id", ""))
+    bot_qq = str(BOT_QQ) if 'BOT_QQ' in globals() else ""
+    
+    # 建立一个合法的 ID 集合
+    my_ids = {self_id, bot_qq}
+    # 建立一个可能的昵称集合（如果你的机器人叫 Roxy）
+    my_names = {"@Roxy", f"@{self_id}"} 
+
     for seg in msgs:
-        if seg.get("type") == "at":
-            qq = str(seg.get("data", {}).get("qq", "")).strip()
-            if qq in {str(BOT_QQ), str(event.get("self_id"))}:
+        seg_type = seg.get("type")
+        seg_data = seg.get("data", {})
+
+        # 1. 检查标准的 AT 类型（CQ码模式）
+        if seg_type == "at":
+            qq = str(seg_data.get("qq", "")).strip()
+            if qq in my_ids:
                 return True
+        
+        # 2. 检查文本类型（由于某些端会将@识别为纯文本）
+        elif seg_type == "text":
+            content = seg_data.get("text", "").strip()
+            # 只要开头带有 @Roxy 或者任何配置的 ID
+            if any(name in content for name in my_names):
+                return True
+                
     return False
 
 def clean_group_text(event: dict) -> str:
@@ -120,13 +144,26 @@ async def handle_synthetic_event(event: dict):
 async def lifespan(app: FastAPI):
     """
     FastAPI 应用生命周期管理
-    startup: 启动生物钟
+    startup: 启动生物钟 + 显示LLM模型配置
     shutdown: 关闭生物钟
     """
     # 启动时：注册事件处理函数并启动定时任务
     biorhythm.set_event_processor(handle_synthetic_event)
     biorhythm.start()
-    log_app("[主程序] FastAPI 应用启动，生物钟已初始化", level="info")
+    
+    # 显示LLM模型信息
+    llm_info = (
+        f"\n{'='*60}\n"
+        f"🤖 LLM 厂商信息\n"
+        f"{'='*60}\n"
+        f"当前选择厂商: {ACTIVE_PROVIDER_NAME.upper()}\n"
+        f"服务商标识 (LLM_PROVIDER): {LLM_PROVIDER}\n"
+        f"模型前缀 (MODEL_NAME): {MODEL_NAME}\n"
+        f"API Key 已配置: {'✓' if ACTIVE_API_KEY else '✗'}\n"
+        f"{'='*60}\n"
+    )
+    log_app(llm_info, level="info")
+    log_app(f"[主程序] FastAPI 应用启动，生物钟已初始化", level="info")
     
     yield
     
@@ -284,7 +321,9 @@ async def handle_private_message(event: dict):
             decision=decision,
             user_id=user_id,
             username=username,
-            group_id=None
+            group_id=None,
+            enable_grok_refine=REFINE_WITH_GROK,
+            persona_config=PERSONA_CONFIG
         )
         print(f"[24] execute_decision后: success={exec_result.success}")
         
@@ -389,7 +428,9 @@ async def handle_group_message(event: dict):
             decision=decision,
             user_id=user_id,
             username=username,
-            group_id=group_id
+            group_id=group_id,
+            enable_grok_refine=REFINE_WITH_GROK,
+            persona_config=PERSONA_CONFIG
         )
         
         log_action(
